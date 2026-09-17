@@ -9,8 +9,11 @@ single worker lock because ``TradingAgentsGraph`` calls the process-global
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import json
 import queue
+import re
 import threading
 import traceback
 import uuid
@@ -69,6 +72,21 @@ class Run:
         self._processed_message_ids: set[str] = set()
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
+
+    @classmethod
+    def from_snapshot(cls, snap: dict[str, Any]) -> Run:
+        run = cls(snap["params"])
+        run.id = snap["id"]
+        run.created_at = snap.get("created_at", run.created_at)
+        run.status = snap.get("status", "completed")
+        run.error = snap.get("error")
+        run.agent_status = dict(snap.get("agent_status", {}))
+        run.sections = dict(snap.get("sections", {}))
+        run.messages = list(snap.get("messages", []))
+        run.stats = dict(snap.get("stats", {}))
+        run.report_path = snap.get("report_path")
+        run.decision = snap.get("decision")
+        return run
 
     # ---- snapshot / events -------------------------------------------------
 
@@ -161,10 +179,110 @@ class Run:
         self._emit("stats", self.stats)
 
 
+WEB_DIR = Path(DEFAULT_CONFIG["results_dir"]) / "web"
+RUNS_DIR = WEB_DIR / "runs"
+
+# Report-tree files -> UI section keys, for rebuilding runs that predate run.json.
+_SECTION_FILES = {
+    "market_report": ["1_analysts/market.md"],
+    "sentiment_report": ["1_analysts/sentiment.md"],
+    "news_report": ["1_analysts/news.md"],
+    "fundamentals_report": ["1_analysts/fundamentals.md"],
+    "investment_plan": ["2_research/bull.md", "2_research/bear.md", "2_research/manager.md"],
+    "trader_investment_plan": ["3_trading/trader.md"],
+    "final_trade_decision": [
+        "4_risk/aggressive.md", "4_risk/conservative.md", "4_risk/neutral.md", "5_portfolio/decision.md",
+    ],
+}
+_FILE_TITLES = {
+    "bull.md": "Bull Researcher Analysis", "bear.md": "Bear Researcher Analysis",
+    "manager.md": "Research Manager Decision", "aggressive.md": "Aggressive Analyst Analysis",
+    "conservative.md": "Conservative Analyst Analysis", "neutral.md": "Neutral Analyst Analysis",
+    "decision.md": "Portfolio Manager Decision",
+}
+
+
+def _guess_decision(text: str) -> str | None:
+    for pat in (
+        r"\*\*Rating\*\*:\s*([A-Za-z]+)",
+        r"Decision:\s*\*\*([A-Za-z]+)\*\*",
+        r"FINAL TRANSACTION PROPOSAL:\s*\*\*([A-Za-z]+)\*\*",
+    ):
+        m = re.search(pat, text)
+        if m:
+            return m.group(1).capitalize()
+    return None
+
+
+def _run_from_report_dir(d: Path) -> Run | None:
+    """Rebuild a completed run from the on-disk report tree (no run.json)."""
+    m = re.match(r"^(.+)_(\d{4}-\d{2}-\d{2})_(\d{8}_\d{6})$", d.name)
+    if not m or not (d / "complete_report.md").exists():
+        return None
+    ticker, date, stamp = m.groups()
+    sections: dict[str, str | None] = {}
+    for key, files in _SECTION_FILES.items():
+        parts = []
+        for rel in files:
+            f = d / rel
+            if f.exists():
+                body = f.read_text(encoding="utf-8")
+                title = _FILE_TITLES.get(f.name)
+                parts.append(f"### {title}\n{body}" if title and len(files) > 1 else body)
+        if parts:
+            sections[key] = "\n\n".join(parts)
+    if not sections:
+        return None
+    pm = d / "5_portfolio" / "decision.md"
+    decision = _guess_decision(pm.read_text(encoding="utf-8")) if pm.exists() else None
+    agents = {a: "completed" for team in AGENT_TEAMS.values() for a in team}
+    for key, name in ANALYST_AGENT_NAMES.items():
+        if ANALYST_REPORT_MAP[key] not in sections:
+            agents.pop(name, None)
+    return Run.from_snapshot(
+        {
+            "id": stamp.replace("_", "") + ticker.lower()[:4],
+            "params": {"ticker": ticker, "analysis_date": date, "llm_provider": "?", "analysts": []},
+            "created_at": datetime.datetime.strptime(stamp, "%Y%m%d_%H%M%S").isoformat(timespec="seconds"),
+            "status": "completed",
+            "agent_status": agents,
+            "sections": sections,
+            "messages": [{"time": "", "type": "System", "content": f"Restored from {d}"}],
+            "report_path": str(d / "complete_report.md"),
+            "decision": decision,
+        }
+    )
+
+
 class RunManager:
     def __init__(self) -> None:
         self.runs: dict[str, Run] = {}
         self._worker_lock = threading.Lock()
+        self._load_saved()
+
+    def _load_saved(self) -> None:
+        """Restore finished runs so a server restart doesn't empty the list."""
+        seen_reports: set[str] = set()
+        for f in sorted(RUNS_DIR.glob("*.json")) if RUNS_DIR.exists() else []:
+            try:
+                run = Run.from_snapshot(json.loads(f.read_text(encoding="utf-8")))
+            except Exception:  # noqa: BLE001 - skip corrupt files
+                continue
+            self.runs[run.id] = run
+            if run.report_path:
+                seen_reports.add(str(Path(run.report_path).parent))
+        for d in sorted(WEB_DIR.iterdir()) if WEB_DIR.exists() else []:
+            if d.is_dir() and d.name != "runs" and str(d) not in seen_reports:
+                run = _run_from_report_dir(d)
+                if run:
+                    self.runs[run.id] = run
+
+    @staticmethod
+    def _persist(run: Run) -> None:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        (RUNS_DIR / f"{run.id}.json").write_text(
+            json.dumps(run.snapshot(), ensure_ascii=False), encoding="utf-8"
+        )
 
     def list(self) -> list[dict[str, Any]]:
         return [r.summary() for r in sorted(self.runs.values(), key=lambda r: r.created_at, reverse=True)]
@@ -188,6 +306,8 @@ class RunManager:
                 run.add_message("System", f"Error: {exc}\n{traceback.format_exc()}")
                 run.set_status("failed", error=str(exc))
             finally:
+                with contextlib.suppress(Exception):  # persistence is best-effort
+                    self._persist(run)
                 run._close()
 
 
