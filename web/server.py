@@ -155,6 +155,14 @@ def get_run(run_id: str) -> dict[str, Any]:
     return run.snapshot()
 
 
+@app.delete("/api/runs/{run_id}")
+def delete_run(run_id: str) -> dict[str, Any]:
+    run = manager.get(run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    return {"id": run_id, "result": manager.cancel(run)}
+
+
 @app.get("/api/runs/{run_id}/events")
 async def run_events(run_id: str) -> StreamingResponse:
     run = manager.get(run_id)

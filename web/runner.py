@@ -54,6 +54,10 @@ MAX_MESSAGES = 300
 _EOF = object()
 
 
+class RunCancelled(Exception):
+    """Raised inside the worker when the user cancels a run."""
+
+
 class Run:
     """Mutable state for one analysis run plus its event fan-out."""
 
@@ -61,7 +65,7 @@ class Run:
         self.id = uuid.uuid4().hex[:10]
         self.params = params
         self.created_at = datetime.datetime.now().isoformat(timespec="seconds")
-        self.status = "queued"  # queued | running | completed | failed
+        self.status = "queued"  # queued | running | completed | failed | cancelled
         self.error: str | None = None
         self.agent_status: dict[str, str] = {}
         self.sections: dict[str, str | None] = {}
@@ -70,6 +74,7 @@ class Run:
         self.report_path: str | None = None
         self.decision: str | None = None
         self._processed_message_ids: set[str] = set()
+        self.cancel_requested = threading.Event()
         self._lock = threading.Lock()
         self._subscribers: list[queue.Queue] = []
 
@@ -120,7 +125,7 @@ class Run:
         q: queue.Queue = queue.Queue()
         with self._lock:
             self._subscribers.append(q)
-            if self.status in ("completed", "failed"):
+            if self.status in ("completed", "failed", "cancelled"):
                 q.put(_EOF)
         return q
 
@@ -296,12 +301,39 @@ class RunManager:
         threading.Thread(target=self._execute, args=(run,), daemon=True, name=f"run-{run.id}").start()
         return run
 
+    def cancel(self, run: Run) -> str:
+        """Cancel a queued/running run, or drop a finished one from the list.
+
+        Returns the resulting state: "cancelled" (will stop at the next graph
+        step; an in-flight LLM call cannot be interrupted) or "deleted".
+        """
+        if run.status in ("queued", "running"):
+            run.cancel_requested.set()
+            if run.status == "queued":
+                # Worker hasn't started; it will see the flag and skip the run.
+                run.set_status("cancelled")
+                run._close()
+                with contextlib.suppress(Exception):
+                    self._persist(run)
+            else:
+                run.add_message("System", "Cancellation requested — stopping after the current step.")
+            return "cancelled"
+        self.runs.pop(run.id, None)
+        with contextlib.suppress(FileNotFoundError):
+            (RUNS_DIR / f"{run.id}.json").unlink()
+        return "deleted"
+
     def _execute(self, run: Run) -> None:
         with self._worker_lock:
+            if run.cancel_requested.is_set():
+                return  # cancelled while queued; cancel() already finalised it
             try:
                 run.set_status("running")
                 _run_analysis(run)
                 run.set_status("completed")
+            except RunCancelled:
+                run.add_message("System", "Run cancelled.")
+                run.set_status("cancelled")
             except Exception as exc:  # noqa: BLE001 - surface anything to the UI
                 run.add_message("System", f"Error: {exc}\n{traceback.format_exc()}")
                 run.set_status("failed", error=str(exc))
@@ -368,6 +400,8 @@ def _run_analysis(run: Run) -> None:
         f"Provider: {config['llm_provider']} | quick={config['quick_think_llm']} deep={config['deep_think_llm']}",
     )
 
+    if run.cancel_requested.is_set():
+        raise RunCancelled
     graph = TradingAgentsGraph(selected, config=config, debug=True, callbacks=[stats_handler])
     run.update_agent(ANALYST_AGENT_NAMES[selected[0]], "in_progress")
 
@@ -383,6 +417,8 @@ def _run_analysis(run: Run) -> None:
     trace: list[dict[str, Any]] = []
     try:
         for chunk in graph.graph.stream(graph.checkpoint_input(init_state), **args):
+            if run.cancel_requested.is_set():
+                raise RunCancelled
             _process_chunk(run, chunk, selected)
             run.update_stats(stats_handler.get_stats())
             trace.append(chunk)

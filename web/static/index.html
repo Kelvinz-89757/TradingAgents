@@ -257,7 +257,14 @@
   .run .dec.bull { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); }
   .run .dec.bear { color: var(--red); background: color-mix(in srgb, var(--red) 14%, transparent); }
   .run .dec.hold { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 14%, transparent); }
-  .run .dec.running { color: var(--yellow); } .run .dec.failed { color: var(--red); } .run .dec.queued { color: var(--muted); }
+  .run .dec.running { color: var(--yellow); } .run .dec.failed { color: var(--red); } .run .dec.queued, .run .dec.cancelled { color: var(--muted); }
+  .run .x { width: 22px; height: 22px; border-radius: 6px; border: 0; background: transparent; color: var(--muted); cursor: pointer; display: grid; place-items: center; flex: none; opacity: 0; transition: all .2s ease; padding: 0; }
+  .run:hover .x { opacity: 1; }
+  .run .x:hover { background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red); }
+  .run .x svg { width: 12px; height: 12px; stroke: currentColor; stroke-width: 2.5; fill: none; }
+  .run.leaving { opacity: 0; transform: translateX(16px); transition: all .25s ease; }
+  .pill.cancelled { color: var(--muted); }
+  .btn.ghost.danger:hover { border-color: var(--red); color: var(--red); }
 
   /* ---------- toast ---------- */
   #toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(20px); opacity: 0; background: var(--panel); color: var(--text-strong); border: 1px solid var(--border); padding: 10px 16px; border-radius: 10px; box-shadow: var(--shadow); font-size: 13px; transition: all .3s ease; pointer-events: none; z-index: 20; }
@@ -331,7 +338,9 @@
   <section class="right stagger">
     <div class="row">
       <div class="card">
-        <h2>Progress <span class="count" id="pct"></span></h2>
+        <h2>Progress <span class="count" id="pct"></span>
+          <div class="toolbar"><button class="btn ghost danger" id="stop" type="button" style="display:none">Stop</button></div>
+        </h2>
         <div class="title" id="rtitle">Start a run from the left panel.</div>
         <div class="decision" id="decision"></div>
         <div class="progress" id="progress"><div class="bar" id="bar"></div></div>
@@ -468,9 +477,30 @@ async function refreshRuns() {
   $('runs').innerHTML = runs.length ? runs.map(r => {
     const cls = r.decision ? decisionClass(r.decision) : r.status;
     const txt = r.decision || r.status;
-    return `<div class="run ${current && current.id === r.id ? 'active' : ''}" onclick="attach('${r.id}')"><span class="tk">${esc(r.ticker)}</span><span class="dt">${r.date}</span><span class="dec ${cls}">${esc(txt)}</span></div>`;
+    const title = r.status === 'queued' ? 'Remove from queue' : r.status === 'running' ? 'Stop this run' : 'Delete from list';
+    return `<div class="run ${current && current.id === r.id ? 'active' : ''}" id="run-${r.id}" onclick="attach('${r.id}')"><span class="tk">${esc(r.ticker)}</span><span class="dt">${r.date}</span><span class="dec ${cls}">${esc(txt)}</span><button class="x" title="${title}" onclick="event.stopPropagation();removeRun('${r.id}','${r.status}')"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`;
   }).join('') : '<span class="empty">none yet</span>';
 }
+
+async function removeRun(id, status) {
+  if (status === 'running' && !confirm('Stop this running analysis? It will halt after the current step.')) return;
+  const r = await fetch(`/api/runs/${id}`, { method: 'DELETE' });
+  if (!r.ok) return toast('Failed: ' + (await r.text()).slice(0, 120));
+  const { result } = await r.json();
+  if (result === 'deleted') {
+    const el = $(`run-${id}`); if (el) { el.classList.add('leaving'); await new Promise(res => setTimeout(res, 250)); }
+    if (current && current.id === id) { if (es) es.close(); es = null; current = null; resetView(); history.replaceState(null, '', ' '); }
+    toast('Run removed');
+  } else toast(status === 'queued' ? 'Removed from queue' : 'Stopping after current step…');
+  refreshRuns();
+}
+function resetView() {
+  $('pill').className = 'pill'; $('pilltext').textContent = 'idle'; $('elapsed').style.display = 'none'; $('stop').style.display = 'none';
+  $('rtitle').textContent = 'Start a run from the left panel.'; $('decision').innerHTML = ''; $('bar').style.width = '0'; $('pct').textContent = '';
+  $('teams').innerHTML = ''; $('stats').innerHTML = ''; $('tabs').innerHTML = ''; $('log').innerHTML = ''; $('copy').style.display = 'none';
+  $('report').innerHTML = '<span class="empty">Reports stream in here as each agent finishes.</span>';
+}
+$('stop').addEventListener('click', () => current && removeRun(current.id, current.status));
 
 /* ---------- attach to a run ---------- */
 function attach(id) {
@@ -487,7 +517,7 @@ function attach(id) {
   es.addEventListener('message', (e) => { const m = JSON.parse(e.data); current.messages.push(m); appendMessage(m); });
   es.addEventListener('stats', (e) => { current.stats = JSON.parse(e.data); renderStats(); });
   es.addEventListener('done', (e) => { const d = JSON.parse(e.data); current.decision = d.decision; renderStatus(); toast('Analysis complete'); });
-  es.addEventListener('end', () => { es.close(); es = null; stopTimer(); refreshRuns(); renderTeams(); });
+  es.addEventListener('end', () => { es.close(); es = null; stopTimer(); refreshRuns(); renderTeams(); renderStatus(); });
   refreshRuns();
 }
 function skeleton() { return '<div class="skeleton"><div></div><div></div><div></div><div></div><div></div></div>'; }
@@ -503,6 +533,8 @@ function renderStatus() {
   else if (current.error) $('decision').innerHTML = `<span class="badge err">${esc(current.error).slice(0, 200)}</span>`;
   else $('decision').innerHTML = '';
   if (current.status === 'completed' && current.sections) { $('copy').style.display = ''; }
+  $('stop').style.display = (current.status === 'running' || current.status === 'queued') ? '' : 'none';
+  $('stop').textContent = current.status === 'queued' ? 'Remove from queue' : 'Stop';
 }
 
 function renderTeams() {
@@ -510,7 +542,7 @@ function renderTeams() {
   const done = keys.filter(k => st[k] === 'completed').length;
   const pct = keys.length ? Math.round(done / keys.length * 100) : 0;
   $('bar').style.width = pct + '%'; $('pct').textContent = keys.length ? `${done}/${keys.length}` : '';
-  $('progress').classList.toggle('done', current.status === 'completed' || current.status === 'failed');
+  $('progress').classList.toggle('done', ['completed', 'failed', 'cancelled'].includes(current.status));
   $('teams').innerHTML = Object.entries(OPTS.teams).map(([team, agents]) => {
     const rows = agents.filter(a => a in st).map(a =>
       `<div class="agent ${st[a]}"><span class="st"><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg></span><span class="lbl">${a}</span><span class="tag">${st[a] === 'in_progress' ? 'working' : st[a] === 'completed' ? 'done' : ''}</span></div>`).join('');
