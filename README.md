@@ -115,6 +115,28 @@ Install the package and its dependencies:
 pip install .
 ```
 
+### Web UI (optional)
+
+A browser front end wraps the same analysis pipeline as the CLI (live agent
+status, streaming reports, message log):
+
+```bash
+pip install -e ".[web]"
+python -m web            # http://127.0.0.1:8501
+```
+
+To use it from another device on your [Tailscale](https://tailscale.com) tailnet:
+
+```bash
+scripts/serve_tailscale.sh
+```
+
+This uses `tailscale serve` (HTTPS at `https://<machine>.<tailnet>.ts.net/`) when
+Serve is enabled for the tailnet, and otherwise binds the server to the node's
+Tailscale IP (`http://<machine>.<tailnet>.ts.net:8501/`). Either way the UI is
+only reachable from devices logged into the tailnet. API keys are read from
+`.env` on the machine running the server.
+
 ### Docker
 
 Alternatively, run with Docker:
