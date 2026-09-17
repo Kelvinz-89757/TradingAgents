@@ -247,7 +247,7 @@ def _run_from_report_dir(d: Path) -> Run | None:
     return Run.from_snapshot(
         {
             "id": stamp.replace("_", "") + ticker.lower()[:4],
-            "params": {"ticker": ticker, "analysis_date": date, "llm_provider": "?", "analysts": []},
+            "params": {"ticker": ticker, "analysis_date": date, "llm_provider": "", "analysts": []},
             "created_at": datetime.datetime.strptime(stamp, "%Y%m%d_%H%M%S").isoformat(timespec="seconds"),
             "status": "completed",
             "agent_status": agents,

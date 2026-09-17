@@ -262,6 +262,7 @@
   .run:hover .x { opacity: 1; }
   .run .x:hover { background: color-mix(in srgb, var(--red) 15%, transparent); color: var(--red); }
   .run .x svg { width: 12px; height: 12px; stroke: currentColor; stroke-width: 2.5; fill: none; }
+  .run.settled { animation: none; }
   .run.leaving { opacity: 0; transform: translateX(16px); transition: all .25s ease; }
   .pill.cancelled { color: var(--muted); }
   .btn.ghost.danger:hover { border-color: var(--red); color: var(--red); }
@@ -471,15 +472,24 @@ $('form').addEventListener('submit', async (e) => {
 });
 
 /* ---------- runs list ---------- */
+let lastRunsKey = '';
 async function refreshRuns() {
   const runs = await (await fetch('/api/runs')).json();
   $('runcount').textContent = runs.length ? runs.length : '';
-  $('runs').innerHTML = runs.length ? runs.map(r => {
-    const cls = r.decision ? decisionClass(r.decision) : r.status;
-    const txt = r.decision || r.status;
-    const title = r.status === 'queued' ? 'Remove from queue' : r.status === 'running' ? 'Stop this run' : 'Delete from list';
-    return `<div class="run ${current && current.id === r.id ? 'active' : ''}" id="run-${r.id}" onclick="attach('${r.id}')"><span class="tk">${esc(r.ticker)}</span><span class="dt">${r.date}</span><span class="dec ${cls}">${esc(txt)}</span><button class="x" title="${title}" onclick="event.stopPropagation();removeRun('${r.id}','${r.status}')"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`;
-  }).join('') : '<span class="empty">none yet</span>';
+  const key = JSON.stringify(runs);
+  if (key !== lastRunsKey) {
+    // Rebuild only when the data changed; cards that already existed keep
+    // their place and skip the entrance animation so the list doesn't blink.
+    const existing = new Set([...$('runs').querySelectorAll('.run')].map(el => el.dataset.id));
+    lastRunsKey = key;
+    $('runs').innerHTML = runs.length ? runs.map(r => {
+      const cls = r.decision ? decisionClass(r.decision) : r.status;
+      const txt = r.decision || r.status;
+      const title = r.status === 'queued' ? 'Remove from queue' : r.status === 'running' ? 'Stop this run' : 'Delete from list';
+      return `<div class="run ${existing.has(r.id) ? 'settled' : ''}" data-id="${r.id}" id="run-${r.id}" onclick="attach('${r.id}')"><span class="tk">${esc(r.ticker)}</span><span class="dt">${r.date}</span><span class="dec ${cls}">${esc(txt)}</span><button class="x" title="${title}" onclick="event.stopPropagation();removeRun('${r.id}','${r.status}')"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>`;
+    }).join('') : '<span class="empty">none yet</span>';
+  }
+  $('runs').querySelectorAll('.run').forEach(el => el.classList.toggle('active', !!current && current.id === el.dataset.id));
 }
 
 async function removeRun(id, status) {
@@ -507,7 +517,7 @@ function attach(id) {
   if (es) es.close();
   current = { id, agent_status: {}, sections: {}, messages: [], stats: {}, status: 'queued', params: {} };
   activeTab = null;
-  $('log').innerHTML = ''; $('report').innerHTML = skeleton(); $('decision').innerHTML = ''; $('copy').style.display = 'none';
+  $('log').innerHTML = ''; $('decision').innerHTML = ''; $('copy').style.display = 'none';
   es = new EventSource(`/api/runs/${id}/events`);
   es.addEventListener('snapshot', (e) => { Object.assign(current, JSON.parse(e.data)); renderAll(); startTimer(); });
   es.addEventListener('init', (e) => { const d = JSON.parse(e.data); current.agent_status = d.agent_status; d.sections.forEach(s => current.sections[s] = current.sections[s] || null); renderTeams(); renderTabs(); });
@@ -518,7 +528,7 @@ function attach(id) {
   es.addEventListener('stats', (e) => { current.stats = JSON.parse(e.data); renderStats(); });
   es.addEventListener('done', (e) => { const d = JSON.parse(e.data); current.decision = d.decision; renderStatus(); toast('Analysis complete'); });
   es.addEventListener('end', () => { es.close(); es = null; stopTimer(); refreshRuns(); renderTeams(); renderStatus(); });
-  refreshRuns();
+  $('runs').querySelectorAll('.run').forEach(el => el.classList.toggle('active', el.dataset.id === id));
 }
 function skeleton() { return '<div class="skeleton"><div></div><div></div><div></div><div></div><div></div></div>'; }
 
@@ -528,7 +538,7 @@ function renderAll() { renderStatus(); renderTeams(); renderTabs(); renderReport
 function renderStatus() {
   const p = current.params || {};
   $('pill').className = 'pill ' + current.status; $('pilltext').textContent = current.status;
-  $('rtitle').innerHTML = p.ticker ? `<b>${esc(p.ticker)}</b> · ${p.analysis_date} · ${esc(p.llm_provider)} <span class="mono" style="font-size:11px">${esc(p.deep_think_llm || '')}</span>` : '';
+  $('rtitle').innerHTML = p.ticker ? [`<b>${esc(p.ticker)}</b>`, p.analysis_date, esc(p.llm_provider || ''), p.deep_think_llm ? `<span class="mono" style="font-size:11px">${esc(p.deep_think_llm)}</span>` : ''].filter(Boolean).join(' · ') : '';
   if (current.decision) $('decision').innerHTML = `<span class="badge ${decisionClass(current.decision)}">${esc(current.decision)}</span>`;
   else if (current.error) $('decision').innerHTML = `<span class="badge err">${esc(current.error).slice(0, 200)}</span>`;
   else $('decision').innerHTML = '';
@@ -537,33 +547,52 @@ function renderStatus() {
   $('stop').textContent = current.status === 'queued' ? 'Remove from queue' : 'Stop';
 }
 
+let teamsKey = '';
 function renderTeams() {
   const st = current.agent_status, keys = Object.keys(st);
   const done = keys.filter(k => st[k] === 'completed').length;
   const pct = keys.length ? Math.round(done / keys.length * 100) : 0;
   $('bar').style.width = pct + '%'; $('pct').textContent = keys.length ? `${done}/${keys.length}` : '';
   $('progress').classList.toggle('done', ['completed', 'failed', 'cancelled'].includes(current.status));
-  $('teams').innerHTML = Object.entries(OPTS.teams).map(([team, agents]) => {
-    const rows = agents.filter(a => a in st).map(a =>
-      `<div class="agent ${st[a]}"><span class="st"><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg></span><span class="lbl">${a}</span><span class="tag">${st[a] === 'in_progress' ? 'working' : st[a] === 'completed' ? 'done' : ''}</span></div>`).join('');
-    return rows ? `<div class="team"><div class="name">${team}</div>${rows}</div>` : '';
-  }).join('');
+  const key = current.id + ':' + keys.join(',');
+  if (key !== teamsKey) {                       // structure changed: rebuild rows
+    teamsKey = key;
+    $('teams').innerHTML = Object.entries(OPTS.teams).map(([team, agents]) => {
+      const rows = agents.filter(a => a in st).map(a =>
+        `<div class="agent" data-agent="${a}"><span class="st"><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg></span><span class="lbl">${a}</span><span class="tag"></span></div>`).join('');
+      return rows ? `<div class="team"><div class="name">${team}</div>${rows}</div>` : '';
+    }).join('');
+  }
+  $('teams').querySelectorAll('.agent').forEach(el => {     // patch state only where it changed
+    const v = st[el.dataset.agent];
+    if (el.dataset.state === v) return;
+    el.dataset.state = v; el.className = 'agent ' + v;
+    el.querySelector('.tag').textContent = v === 'in_progress' ? 'working' : v === 'completed' ? 'done' : '';
+  });
 }
 
+let tabsKey = '';
 function renderTabs() {
   const keys = Object.keys(current.sections);
   if (!activeTab) activeTab = keys.find(k => current.sections[k]) || keys[0];
   const live = current.status === 'running' ? keys.find(k => !current.sections[k]) : null;
-  $('tabs').innerHTML = keys.map(k =>
-    `<span class="tab ${k === activeTab ? 'active' : ''} ${current.sections[k] ? 'has' : ''} ${k === live ? 'live' : ''}" onclick="activeTab='${k}';renderTabs();renderReport()"><span class="ind"></span>${OPTS.section_titles[k] || k}</span>`).join('');
+  const key = current.id + ':' + keys.join(',');
+  if (key !== tabsKey) {
+    tabsKey = key;
+    $('tabs').innerHTML = keys.map(k =>
+      `<span class="tab" data-k="${k}" onclick="activeTab='${k}';renderTabs();renderReport()"><span class="ind"></span>${OPTS.section_titles[k] || k}</span>`).join('');
+  }
+  $('tabs').querySelectorAll('.tab').forEach(el => {
+    const k = el.dataset.k;
+    el.classList.toggle('active', k === activeTab); el.classList.toggle('has', !!current.sections[k]); el.classList.toggle('live', k === live);
+  });
 }
 
 function renderReport() {
   const c = activeTab && current.sections[activeTab];
   const el = $('report');
-  if (c) { el.innerHTML = md(c); el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; }
-  else if (current.status === 'running' || current.status === 'queued') el.innerHTML = skeleton();
-  else el.innerHTML = '<span class="empty">No content for this section.</span>';
+  if (c) { if (el.dataset.key !== current.id + activeTab || el.dataset.len !== String(c.length)) { el.innerHTML = md(c); el.dataset.key = current.id + activeTab; el.dataset.len = String(c.length); el.style.animation = 'none'; void el.offsetWidth; el.style.animation = ''; } }
+  else { el.dataset.key = ''; el.innerHTML = (current.status === 'running' || current.status === 'queued') ? skeleton() : '<span class="empty">No content for this section.</span>'; }
 }
 
 function renderStats() {
