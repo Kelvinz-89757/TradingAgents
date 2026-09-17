@@ -21,6 +21,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 load_dotenv()  # picks up API keys from ./.env like the CLI does
@@ -34,6 +35,7 @@ from web.runner import _EOF, AGENT_TEAMS, SECTION_TITLES, RunManager  # noqa: E4
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="TradingAgents Web")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 manager = RunManager()
 
 
@@ -56,6 +58,11 @@ class RunRequest(BaseModel):
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> FileResponse:
+    return FileResponse(STATIC_DIR / "favicon-32.png", media_type="image/png")
 
 
 @app.get("/api/options")
